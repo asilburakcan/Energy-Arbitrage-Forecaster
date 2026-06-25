@@ -159,14 +159,12 @@ def get_weather_at_timestamp(wx_df, ts):
 
 def fetch_prices(country: str, days_back: int = 30) -> pd.Series:
     code = COUNTRY_CODES.get(country.upper(), country)
-    # Fiyatlar önceden açıklandığı için yarının sonuna kadar çekilebilir
     end = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
     start = end - pd.Timedelta(days=days_back)
     return client_entsoe.query_day_ahead_prices(code, start=start, end=end)
 
 def fetch_load(country: str, days_back: int = 30) -> pd.DataFrame:
     code = COUNTRY_CODES.get(country.upper(), country)
-    # HATA ÇÖZÜLDÜ: Gerçekleşen yük sadece şu anki saate (now) kadar çekilebilir
     end = pd.Timestamp.now(tz="UTC").floor("h")
     start = end - pd.Timedelta(days=days_back)
     return client_entsoe.query_load(code, start=start, end=end).resample("1h").mean()
@@ -175,7 +173,6 @@ def fetch_load(country: str, days_back: int = 30) -> pd.DataFrame:
 
 def fetch_generation(country: str, days_back: int = 30) -> pd.DataFrame:
     code = COUNTRY_CODES.get(country.upper(), country)
-    # HATA ÇÖZÜLDÜ: Gerçekleşen üretim sadece şu anki saate (now) kadar çekilebilir
     end = pd.Timestamp.now(tz="UTC").floor("h")
     start = end - pd.Timedelta(days=days_back)
     return client_entsoe.query_generation(code, start=start, end=end).resample("1h").mean()
@@ -245,9 +242,6 @@ def train_model(df: pd.DataFrame, target_col: str):
     X = df.drop(columns=[target_col])
     y = df[target_col]
 
-    # -------------------------------------------------
-    # 1. CHRONOLOGICAL SPLIT (NO SHUFFLE, NO RANDOM)
-    # -------------------------------------------------
     train_size = int(len(df) * 0.7)
     val_size   = int(len(df) * 0.15)
 
@@ -260,9 +254,6 @@ def train_model(df: pd.DataFrame, target_col: str):
     X_test = X.iloc[train_size + val_size:]
     y_test = y.iloc[train_size + val_size:]
 
-    # -------------------------------------------------
-    # 2. MODEL TRAINING (VALIDATION CONTROLLED)
-    # -------------------------------------------------
     model = LGBMRegressor(
         n_estimators=2000,
         learning_rate=0.03,
@@ -278,9 +269,6 @@ def train_model(df: pd.DataFrame, target_col: str):
         callbacks=[early_stopping(50), log_evaluation(100)]
     )
 
-    # -------------------------------------------------
-    # 3. FINAL TEST EVALUATION (ONLY TRUTH)
-    # -------------------------------------------------
     y_pred = model.predict(X_test)
 
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
@@ -290,9 +278,6 @@ def train_model(df: pd.DataFrame, target_col: str):
     print(f"\nTEST RESULTS")
     print(f"RMSE: {rmse:.2f} | MAE: {mae:.2f} | R²: {r2:.3f}")
 
-    # -------------------------------------------------
-    # 4. OPTIONAL: LIGHTWEIGHT CV (TRAIN ONLY, NO TEST LEAKAGE)
-    # -------------------------------------------------
     tscv = TimeSeriesSplit(n_splits=5)
 
     cv_scores = []
@@ -315,9 +300,6 @@ def train_model(df: pd.DataFrame, target_col: str):
     print(f"\nCV RESULTS (TRAIN ONLY)")
     print(f"CV R² mean: {np.mean(cv_scores):.3f}")
 
-    # -------------------------------------------------
-    # 5. FEATURE IMPORTANCE (UNCHANGED)
-    # -------------------------------------------------
     feat_imp = pd.Series(model.feature_importances_, index=X.columns)
     top10 = feat_imp.nlargest(10)
 
@@ -547,15 +529,14 @@ def arbitrage_signal(
                 spiked_price = row["price_b"]
                 spiked_pct = row["pct_change_b"]
             
-            # Ülkeye göre asıl pazar yük ve üretim verileri (MW)
             if spiked_country == country_a:
                 load_actual = row.get("load_a")
-                generation_solar = row.get("solar_a")  # İsmini değiştirdik çakışmasın diye
+                generation_solar = row.get("solar_a")  
                 wind_onshore = row.get("wind_onshore_a")
                 wind_offshore = row.get("wind_offshore_a")
             else:
                 load_actual = row.get("load_b")
-                generation_solar = row.get("solar_b")  # İsmini değiştirdik çakışmasın diye
+                generation_solar = row.get("solar_b")  
                 wind_onshore = row.get("wind_onshore_b")
                 wind_offshore = row.get("wind_offshore_b")
             
@@ -576,7 +557,7 @@ def arbitrage_signal(
                     temp = wx_hist["wx_temperature_2m"]
                     wind = wx_hist["wx_wind_speed_10m"]
                     cloud = wx_hist["wx_cloud_cover"]
-                    wx_solar_rad = wx_hist["wx_shortwave_radiation"] # İsmini değiştirdik
+                    wx_solar_rad = wx_hist["wx_shortwave_radiation"] 
                     
                     weather_signals = []
                     if temp > 30:
@@ -831,7 +812,6 @@ def main():
     print("=" * 40)
 
     while True:
-        # ── Önce ülke ve geçmiş seçimi ──
         country   = input("\nCountry (DE/FR/NL/BE/AT) or q to quit: ").strip().upper()
         if country == "Q":
             break
@@ -883,7 +863,6 @@ def main():
         print("\n  Training model...")
         model, X_test, y_test, y_pred = train_model(df, price_col)
 
-        # ── Sonra ne yapmak istediğini sor ──
         while True:
             print("\n1) Future price forecast")
             print("2) Arbitrage signal")
