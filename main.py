@@ -4,7 +4,6 @@ import os
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
@@ -131,7 +130,8 @@ def fetch_weather_forecast(country: str, hours_ahead: int = 48) -> pd.DataFrame:
             df_loc["time"] = pd.to_datetime(df_loc["time"], utc=True)
             df_loc = df_loc.set_index("time")
             now = pd.Timestamp.now(tz="UTC")
-            df_loc = df_loc[df_loc.index >= now].head(hours_ahead)
+            df_loc = df_loc[df_loc.index >= now - pd.Timedelta(hours=3)]
+            df_loc = df_loc.head(hours_ahead + 3)
             all_dfs.append(df_loc)
         except Exception as e:
             print(f"  Forecast fetch failed for {coord}: {e}")
@@ -164,13 +164,13 @@ def fetch_prices(country: str, days_back: int = 30) -> pd.Series:
     start = end - pd.Timedelta(days=days_back)
     return client_entsoe.query_day_ahead_prices(code, start=start, end=end)
 
-
 def fetch_load(country: str, days_back: int = 30) -> pd.DataFrame:
     code = COUNTRY_CODES.get(country.upper(), country)
     # HATA ÇÖZÜLDÜ: Gerçekleşen yük sadece şu anki saate (now) kadar çekilebilir
     end = pd.Timestamp.now(tz="UTC").floor("h")
     start = end - pd.Timedelta(days=days_back)
-    return client_entsoe.query_load(code, start=start, end=end)
+    return client_entsoe.query_load(code, start=start, end=end).resample("1h").mean()
+
 
 
 def fetch_generation(country: str, days_back: int = 30) -> pd.DataFrame:
@@ -178,7 +178,7 @@ def fetch_generation(country: str, days_back: int = 30) -> pd.DataFrame:
     # HATA ÇÖZÜLDÜ: Gerçekleşen üretim sadece şu anki saate (now) kadar çekilebilir
     end = pd.Timestamp.now(tz="UTC").floor("h")
     start = end - pd.Timedelta(days=days_back)
-    return client_entsoe.query_generation(code, start=start, end=end)
+    return client_entsoe.query_generation(code, start=start, end=end).resample("1h").mean()
 
 
 def build_features(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
@@ -234,48 +234,96 @@ def build_features(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
 
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from sklearn.model_selection import TimeSeriesSplit
 
 
 def train_model(df: pd.DataFrame, target_col: str):
+
     df = build_features(df, target_col)
+
     X = df.drop(columns=[target_col])
     y = df[target_col]
 
-    split = int(len(df) * 0.8)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    # -------------------------------------------------
+    # 1. CHRONOLOGICAL SPLIT (NO SHUFFLE, NO RANDOM)
+    # -------------------------------------------------
+    train_size = int(len(df) * 0.7)
+    val_size   = int(len(df) * 0.15)
 
-    val_split = int(len(X_train) * 0.8)
-    X_tr, X_val = X_train.iloc[:val_split], X_train.iloc[val_split:]
-    y_tr, y_val = y_train.iloc[:val_split], y_train.iloc[val_split:]
+    X_train = X.iloc[:train_size]
+    y_train = y.iloc[:train_size]
 
+    X_val = X.iloc[train_size:train_size + val_size]
+    y_val = y.iloc[train_size:train_size + val_size]
+
+    X_test = X.iloc[train_size + val_size:]
+    y_test = y.iloc[train_size + val_size:]
+
+    # -------------------------------------------------
+    # 2. MODEL TRAINING (VALIDATION CONTROLLED)
+    # -------------------------------------------------
     model = LGBMRegressor(
-        n_estimators=1000, learning_rate=0.05, num_leaves=63, random_state=42
+        n_estimators=2000,
+        learning_rate=0.03,
+        num_leaves=63,
+        random_state=42
     )
-    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[])
 
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric="rmse",
+        callbacks=[early_stopping(50), log_evaluation(100)]
+    )
+
+    # -------------------------------------------------
+    # 3. FINAL TEST EVALUATION (ONLY TRUTH)
+    # -------------------------------------------------
     y_pred = model.predict(X_test)
+
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae  = mean_absolute_error(y_test, y_pred)
     r2   = r2_score(y_test, y_pred)
-    print(f"  RMSE: {rmse:.2f} | MAE: {mae:.2f} | R²: {r2:.3f}")
 
+    print(f"\nTEST RESULTS")
+    print(f"RMSE: {rmse:.2f} | MAE: {mae:.2f} | R²: {r2:.3f}")
+
+    # -------------------------------------------------
+    # 4. OPTIONAL: LIGHTWEIGHT CV (TRAIN ONLY, NO TEST LEAKAGE)
+    # -------------------------------------------------
     tscv = TimeSeriesSplit(n_splits=5)
+
     cv_scores = []
-    for tr_idx, val_idx in tscv.split(X):
-        m = LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=63, random_state=42)
-        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-        preds = m.predict(X.iloc[val_idx])
-        cv_scores.append(r2_score(y.iloc[val_idx], preds))
-    print(f"  CV R² (mean): {np.mean(cv_scores):.3f}")
 
+    for tr_idx, val_idx in tscv.split(X_train):
 
+        m = LGBMRegressor(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=63,
+            random_state=42,
+            verbose = -1
+        )
+
+        m.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+
+        preds = m.predict(X_train.iloc[val_idx])
+        cv_scores.append(r2_score(y_train.iloc[val_idx], preds))
+
+    print(f"\nCV RESULTS (TRAIN ONLY)")
+    print(f"CV R² mean: {np.mean(cv_scores):.3f}")
+
+    # -------------------------------------------------
+    # 5. FEATURE IMPORTANCE (UNCHANGED)
+    # -------------------------------------------------
     feat_imp = pd.Series(model.feature_importances_, index=X.columns)
     top10 = feat_imp.nlargest(10)
-    print("\n  Top 10 features:")
+
+    print("\nTop 10 features:")
     for feat, imp in top10.items():
-        print(f"    {feat:<40} {imp:.0f}")
+        print(f"{feat:<40} {imp:.0f}")
 
     return model, X_test, y_test, y_pred
 
@@ -327,6 +375,7 @@ def predict_future(
     wx_fc = fetch_weather_forecast(country, hours_ahead)
     if not wx_fc.empty:
         print(f"  Weather forecast added for {hours_ahead}h ahead.")
+        print(wx_fc.index[:10])
 
     model_cols = model.feature_name_
     last_known_price = df_history[target_col].iloc[-1]
@@ -344,13 +393,32 @@ def predict_future(
         row["is_weekend"] = int(ts.dayofweek >= 5)
         row["price_lag_1"] = last_known_price if i == 0 else predicted_prices[-1]
 
-        if not wx_fc.empty and ts in wx_fc.index:
-            for col in wx_fc.columns:
-                row[col] = wx_fc.loc[ts, col]
+        if not wx_fc.empty:
 
-        for c in model_cols:
-            if c not in row.columns:
-                row[c] = 0.0
+            for col in wx_fc.columns:
+
+                if ts in wx_fc.index:
+                    row[col] = wx_fc.loc[ts, col]
+
+                lag1_ts = ts - pd.Timedelta(hours=1)
+                lag3_ts = ts - pd.Timedelta(hours=3)
+
+                if lag1_ts in wx_fc.index:
+                    row[f"{col}_lag1"] = wx_fc.loc[lag1_ts, col]
+
+                if lag3_ts in wx_fc.index:
+                    row[f"{col}_lag3"] = wx_fc.loc[lag3_ts, col]
+
+                if "wx_temperature_2m" in row.columns:
+
+                    t = row["wx_temperature_2m"].iloc[0]
+
+                    row["heating_degree"] = max(0, 18 - t)
+                    row["cooling_degree"] = max(0, t - 22)
+
+        missing = [c for c in model_cols if c not in row.columns]
+        if missing:
+            raise ValueError(f"Missing features: {missing}")
         row_df = row[model_cols]
         pred = model.predict(row_df)[0]
         predicted_prices.append(pred)
@@ -446,9 +514,9 @@ def arbitrage_signal(
         if wind_diff is not None:
             print(f"    Wind diff  ({country_a}-{country_b}): {wind_diff.head(6).mean():.1f} km/h")
             if wind_diff.head(6).mean() > 5:
-                print(f"    ⚡ Higher wind in {country_a} → potential price drop → spread may narrow")
+                print(f"     Higher wind in {country_a} → potential price drop → spread may narrow")
             elif wind_diff.head(6).mean() < -5:
-                print(f"    ⚡ Higher wind in {country_b} → potential price drop → spread may widen")
+                print(f"     Higher wind in {country_b} → potential price drop → spread may widen")
 
     def signal_row(row):
         if row["spread"] > threshold:
@@ -556,14 +624,6 @@ def arbitrage_signal(
                     """
             except Exception as e:
                 historical_wx_context = f"Weather unavailable: {e}"
-                
-            print("load_actual =", load_actual)
-            print("solar =", generation_solar)
-            print("wind_onshore =", wind_onshore)
-            print("wind_offshore =", wind_offshore)
-            print("spread =", round(price_spread, 2))
-            print("flow_ab =", flow_ab)
-            print("flow_ba =", flow_ba)
     
             market_context = f"""
             Cross-border arbitrage context:
@@ -767,7 +827,7 @@ Give a concise market commentary and key price drivers.
 
 
 def main():
-    print("\n⚡ European Electricity Market CLI")
+    print("\n European Electricity Market CLI")
     print("=" * 40)
 
     while True:
@@ -781,14 +841,21 @@ def main():
         prices  = fetch_prices(country, days_back)
         load_df = fetch_load(country, days_back)
         gen_df  = fetch_generation(country, days_back)
-
+        print(prices.index[:5])
+        print(load_df.index[:5])
+        print(gen_df.index[:5])
+        
         price_col = f"{COUNTRY_CODES.get(country, country)}_price_day_ahead"
-        df = pd.DataFrame({price_col: prices}).join(
-            load_df.iloc[:, 0].rename("load_actual"), how="inner"
+        prices_h = prices.resample("1h").mean()
+        load_h = load_df.iloc[:, 0].resample("1h").mean()
+
+        df = pd.DataFrame({price_col: prices_h}).join(
+        load_h.rename("load_actual"), how="inner"
         )
         for col, alias in [("Solar", "solar"), ("Wind Onshore", "wind_onshore"), ("Wind Offshore", "wind_offshore")]:
             if col in gen_df.columns:
                 df[alias] = gen_df[col].reindex(df.index, method="ffill")
+
 
         print("  Fetching weather data (Open-Meteo)...")
         wx = fetch_weather(country, days_back)
@@ -801,6 +868,17 @@ def main():
 
         df = df.ffill().dropna()
         print(f"  {len(df)} rows ready | {df.shape[1]} columns")
+
+        DROP_COLS = [
+            "load_actual",
+            "solar",
+            "wind_onshore",
+            "wind_offshore",
+        ]
+
+        df = df.drop(
+            columns=[c for c in DROP_COLS if c in df.columns]
+        )
 
         print("\n  Training model...")
         model, X_test, y_test, y_pred = train_model(df, price_col)
@@ -822,12 +900,15 @@ def main():
 
             elif choice == "1":
                 hours_ahead = int(input("Hours ahead (e.g. 24): ").strip())
+                now = pd.Timestamp.now(tz="UTC").floor("h")
+                df_for_forecast = df[df.index <= now]
                 predict_future(
-                    df_history=df,
+                    df_history=df_for_forecast,
                     model=model,
                     target_col=price_col,
                     country=country,
                     hours_ahead=hours_ahead,
+
                 )
 
             elif choice == "2":

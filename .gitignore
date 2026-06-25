@@ -1,0 +1,16 @@
+
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.csv
+*.parquet
+chroma_db/
+*.pdf
+main1havasız.py
+main2havasız.py
+weather2yedekcalisiyor.py
+test.py
+ 
