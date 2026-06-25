@@ -1,0 +1,12 @@
+entsoe-py
+lightgbm
+scikit-learn
+pandas
+numpy
+groq
+chromadb
+langchain
+langchain-community
+sentence-transformers
+pypdf
+python-dotenv
