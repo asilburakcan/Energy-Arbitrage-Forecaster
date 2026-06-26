@@ -573,8 +573,7 @@ def arbitrage_signal(
                 wx_history_df = fetch_weather(spiked_country, days_back)
                 wx_forecast_df = fetch_weather_forecast(spiked_country, hours_ahead=48)
 
-                if (not wx_history_df.empty and ts <= wx_history_df.index.max()
-):
+                if (not wx_history_df.empty and ts <= wx_history_df.index.max()):
                     wx_hist = get_weather_at_timestamp(wx_history_df, ts)
                 else:
                     wx_hist = get_weather_at_timestamp(wx_forecast_df, ts)
